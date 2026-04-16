@@ -79,6 +79,46 @@ python slack_export.py --list-channels
 python slack_export.py --list-dms
 ```
 
+### List channels a specific user shares with you
+
+Use `--list-user` to find every conversation a given user is in that you can also see — handy for figuring out which channels are worth exporting for a teammate or client.
+
+```bash
+# By Slack user ID
+python slack_export.py --list-user U0123ABCDEF
+
+# By real name
+python slack_export.py --list-user "Alice Johnson"
+
+# By display name / @handle
+python slack_export.py --list-user alice
+```
+
+Names are matched case-insensitively against `display_name`, `real_name`, and `name`. If no users match, or more than one does, the command prints an error and exits; pass the exact user ID to disambiguate.
+
+Output:
+
+```
+Channels for @alice (U0123ABCDEF):
+Found 18 channels.
+
+ID              Name                        Type     Members  Last active
+C0123ABCDEF     #product-updates            public   34       2025-06-12
+C0456GHIJKL     #altura-client-x            connect  8        2025-06-10
+G0789MNOPQR     private-leadership          private  5        2025-06-11
+D0888QWERTY     @alice                      dm       2        2025-06-14
+G0999XYZABC     alice, bob, charlie         mpdm     3        2025-05-28
+
+Note: only showing conversations that both you and @alice are members of.
+
+To export a conversation, run:
+  python slack_export.py --channel <ID> --from DD-MM-YYYY --to DD-MM-YYYY
+```
+
+The visibility note is a property of the Slack `users.conversations` API: with a user token it can only return conversations the caller is also a member of. For the "what can I export for this person?" use case this is actually the right answer — those are exactly the channels you have permission to read.
+
+`--list-user` does not require any new OAuth scopes; it reuses the existing read scopes listed above.
+
 ### Filtering by type
 
 Workspaces with hundreds of channels and MPDMs quickly fill the screen. Use `--type` (comma-separated) to narrow `--list` or `--list-channels` to specific types.
@@ -143,12 +183,13 @@ Export complete.
 | `--list` | — | List every conversation you belong to (DMs, channels, MPDMs, Slack Connect). |
 | `--list-channels` | — | List public, private, MPDM, and Slack Connect channels (excludes 1:1 DMs). |
 | `--list-dms` | — | **Deprecated.** Legacy 1:1-DM listing, kept for backwards compatibility. Prefer `--list` or `--list --type dm`. |
+| `--list-user` | `USER_ID` or `NAME` | List conversations a specific user shares with you. Accepts a Slack user ID (`U...`) or a name (matched case-insensitively against `display_name`, `real_name`, `name`). Does not require any new OAuth scopes. |
 | `--type` | `dm,public,private,mpdm,connect` (comma-separated) | Restrict `--list` / `--list-channels` to a subset of types. Only valid with those flags. Narrows the `conversations.list` API call where possible. |
 | `--channel` | `CHANNEL_ID` | Slack conversation ID to export. Accepts `D...` (DM), `C...` (public/private), `G...` (private/MPDM), including Slack Connect channels. |
 | `--from` | `DD-MM-YYYY` | Start date (inclusive). Defaults to 30 days ago. |
 | `--to` | `DD-MM-YYYY` | End date (inclusive). Defaults to today. |
 
-Only one of `--list`, `--list-channels`, `--list-dms` may be passed at a time. `--type` may only be combined with `--list` or `--list-channels`.
+Only one of `--list`, `--list-channels`, `--list-dms`, `--list-user` may be passed at a time. `--type` may only be combined with `--list` or `--list-channels`.
 
 ---
 

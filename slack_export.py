@@ -8,6 +8,8 @@ Usage:
     python slack_export.py --list
     python slack_export.py --list-channels
     python slack_export.py --list-dms                     # deprecated, still works
+    python slack_export.py --list-user U0123ABCDEF
+    python slack_export.py --list-user "Alice Johnson"
     python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025
     python slack_export.py --channel D0123ABCDEF          # defaults to last 30 days
 """
@@ -17,6 +19,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import os
+import re
 import shutil
 import sys
 import threading
@@ -259,6 +262,128 @@ def resolve_user(client: WebClient, user_id: str) -> str:
     display = f"@{name}"
     _user_cache[user_id] = display
     return display
+
+
+# ---------------------------------------------------------------------------
+# User input resolution (user ID or name → (id, @display))
+# ---------------------------------------------------------------------------
+
+# Slack user IDs start with U (regular) or W (Enterprise Grid) followed by an
+# uppercase alphanumeric suffix. The 8+ suffix floor avoids false positives on
+# short all-caps names like "ULRICH" while matching real 9+ character IDs.
+_USER_ID_PATTERN = re.compile(r"^[UW][A-Z0-9]{8,}$")
+
+# users.list is paginated and unchanging within a single invocation; cache the
+# full member list so --list-user resolution only pays for it once.
+_users_list_cache: list[dict] | None = None
+
+# Cap the number of matches shown when an ambiguous name lookup occurs.
+MAX_USER_MATCHES_SHOWN = 10
+
+
+def _fetch_all_users(client: WebClient) -> list[dict]:
+    """Paginate users.list once per process; cached on the module."""
+    global _users_list_cache
+    if _users_list_cache is not None:
+        return _users_list_cache
+
+    members: list[dict] = []
+    cursor: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"limit": MESSAGES_PER_PAGE}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = api_call(client.users_list, **kwargs)
+        members.extend(resp.get("members", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+        time.sleep(REQUEST_DELAY)
+
+    _users_list_cache = members
+    return members
+
+
+def _user_display_from_member(member: dict) -> str:
+    """Pick the best display handle for a users.list / users.info member dict."""
+    profile = member.get("profile") or {}
+    name = (
+        profile.get("display_name")
+        or profile.get("real_name")
+        or member.get("name")
+        or member.get("id", "")
+    )
+    return f"@{name}"
+
+
+def resolve_user_input(client: WebClient, user_input: str) -> tuple[str, str]:
+    """Return (user_id, @display) for a raw --list-user argument.
+
+    If `user_input` matches a Slack user ID pattern, look it up via users.info.
+    Otherwise paginate users.list (cached) and match case-insensitively against
+    display_name, real_name, and name. Exits the process with a clear message
+    on zero or multiple matches, or on user_not_found from users.info.
+    """
+    if _USER_ID_PATTERN.match(user_input):
+        try:
+            resp = api_call(client.users_info, user=user_input)
+        except SlackApiError as exc:
+            error_code = exc.response.get("error", "")
+            if error_code == "user_not_found":
+                _spinner.stop()
+                print(
+                    f"ERROR: No user found with ID '{user_input}'.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            raise
+        member = resp["user"]
+        return member["id"], _user_display_from_member(member)
+
+    _spinner.update(f"Looking up user '{user_input}'...")
+    members = _fetch_all_users(client)
+
+    needle = user_input.lstrip("@").casefold()
+
+    matches: list[dict] = []
+    for m in members:
+        if m.get("deleted") or m.get("is_bot"):
+            continue
+        profile = m.get("profile") or {}
+        candidates = (
+            profile.get("display_name") or "",
+            profile.get("real_name") or "",
+            m.get("name") or "",
+        )
+        if any(c.casefold() == needle for c in candidates if c):
+            matches.append(m)
+
+    if not matches:
+        _spinner.stop()
+        print(
+            f"ERROR: No user found matching '{user_input}'. "
+            "Use --list-user with a Slack user ID (U...) for exact match.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if len(matches) > 1:
+        _spinner.stop()
+        shown = matches[:MAX_USER_MATCHES_SHOWN]
+        formatted = ", ".join(
+            f"{_user_display_from_member(m)} ({m.get('id', '')})" for m in shown
+        )
+        extra = len(matches) - len(shown)
+        suffix = f", ... and {extra} more" if extra > 0 else ""
+        print(
+            f"ERROR: Multiple users match '{user_input}': {formatted}{suffix}. "
+            "Please use the exact user ID.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    member = matches[0]
+    return member["id"], _user_display_from_member(member)
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +841,73 @@ def cmd_list(client: WebClient, type_filter: str | None = None) -> None:
     _print_channel_table(rows, noun="conversations")
 
 
+def _fetch_user_channel_rows(
+    client: WebClient, user_id: str, spinner_label: str
+) -> list[dict]:
+    """Paginate users.conversations(user=...) and build rows via _row_for_channel.
+
+    The returned channel dicts have the same shape as conversations.list, so
+    `_row_for_channel` handles IMs, MPDMs, public/private channels, Slack
+    Connect, and the `(archived)` suffix without modification.
+    """
+    rows: list[dict] = []
+    cursor: str | None = None
+
+    while True:
+        kwargs: dict[str, Any] = {
+            "user": user_id,
+            "types": "im,mpim,public_channel,private_channel",
+            "exclude_archived": False,
+            "limit": MESSAGES_PER_PAGE,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+
+        resp = api_call(client.users_conversations, **kwargs)
+        channels = resp.get("channels", [])
+
+        for ch in channels:
+            row = _row_for_channel(client, ch)
+            if row is None:
+                continue
+            rows.append(row)
+            _spinner.update(f"{spinner_label} found {len(rows)}")
+
+        next_cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = next_cursor
+        time.sleep(REQUEST_DELAY)
+
+    return rows
+
+
+def cmd_list_user(client: WebClient, user_input: str) -> None:
+    """List every conversation the target user shares with the calling user."""
+    _spinner.start(f"Looking up user '{user_input}'...")
+    try:
+        user_id, display = resolve_user_input(client, user_input)
+        label = f"Loading conversations for {display}..."
+        _spinner.update(label)
+        rows = _fetch_user_channel_rows(client, user_id, spinner_label=label)
+        _spinner.stop()
+    finally:
+        _spinner.stop()
+
+    print(f"Channels for {display} ({user_id}):")
+    _print_channel_table(rows, noun="channels")
+
+    if rows:
+        print()
+        print(
+            f"Note: only showing conversations that both you and {display} "
+            "are members of."
+        )
+        print()
+        print("To export a conversation, run:")
+        print("  python slack_export.py --channel <ID> --from DD-MM-YYYY --to DD-MM-YYYY")
+
+
 # ---------------------------------------------------------------------------
 # Fetch thread replies
 # ---------------------------------------------------------------------------
@@ -991,6 +1183,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python slack_export.py --list-channels --type connect\n"
             "  python slack_export.py --list-channels --type mpdm\n"
             "  python slack_export.py --list-dms                       # deprecated\n"
+            "  python slack_export.py --list-user U0123ABCDEF\n"
+            "  python slack_export.py --list-user \"Alice Johnson\"\n"
             "  python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025\n"
             "  python slack_export.py --channel G0999XYZABC            # MPDM, last 30 days\n"
             "  python slack_export.py --channel D0123ABCDEF\n"
@@ -1011,6 +1205,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--list-dms",
         action="store_true",
         help="[Deprecated] List only 1:1 DMs. Use --list instead.",
+    )
+    parser.add_argument(
+        "--list-user",
+        dest="list_user",
+        metavar="USER",
+        help=(
+            "List every conversation a specific user shares with you. "
+            "USER is a Slack user ID (U...) or a name/@handle "
+            "(matched case-insensitively against display_name, real_name, name)."
+        ),
     )
     parser.add_argument(
         "--type",
@@ -1050,10 +1254,10 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    list_flags = [args.list_all, args.list_channels, args.list_dms]
+    list_flags = [args.list_all, args.list_channels, args.list_dms, bool(args.list_user)]
     if sum(1 for f in list_flags if f) > 1:
         print(
-            "ERROR: Pass only one of --list, --list-channels, --list-dms.",
+            "ERROR: Pass only one of --list, --list-channels, --list-dms, --list-user.",
             file=sys.stderr,
         )
         sys.exit(2)
@@ -1080,6 +1284,9 @@ def main() -> None:
             return
         if args.list_dms:
             cmd_list_dms(client)
+            return
+        if args.list_user:
+            cmd_list_user(client, args.list_user)
             return
 
         # Export mode
