@@ -12,8 +12,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import os
+import shutil
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,6 +58,76 @@ INCLUDE_SUBTYPES = {None, "bot_message", "file_share"}
 EXPORT_DIR = Path("export")
 
 # ---------------------------------------------------------------------------
+# Spinner
+# ---------------------------------------------------------------------------
+
+_BOUNCING_BAR_FRAMES = [
+    "[    =     ]", "[   =      ]", "[  =       ]", "[ =        ]",
+    "[=         ]", "[=         ]", "[ =        ]", "[  =       ]",
+    "[   =      ]", "[    =     ]", "[     =    ]", "[      =   ]",
+    "[       =  ]", "[        = ]", "[         =]", "[         =]",
+    "[        = ]", "[       =  ]", "[      =   ]", "[     =    ]",
+]
+_FRAME_INTERVAL = 0.08  # seconds
+
+
+class Spinner:
+    """Bouncing-bar progress indicator that runs on a background thread."""
+
+    def __init__(self) -> None:
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._message = ""
+        self._lock = threading.Lock()
+        self._active = False
+
+    def start(self, message: str = "") -> None:
+        self._stop_event.clear()
+        with self._lock:
+            self._message = message
+        self._active = True
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def update(self, message: str) -> None:
+        with self._lock:
+            self._message = message
+
+    def stop(self, final_message: str = "") -> None:
+        if not self._active:
+            return
+        self._active = False
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join()
+            self._thread = None
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        sys.stdout.write("\r" + " " * width + "\r")
+        sys.stdout.flush()
+        if final_message:
+            print(final_message)
+
+    def _spin(self) -> None:
+        frame_idx = 0
+        while not self._stop_event.is_set():
+            frame = _BOUNCING_BAR_FRAMES[frame_idx % len(_BOUNCING_BAR_FRAMES)]
+            with self._lock:
+                msg = self._message
+            width = shutil.get_terminal_size(fallback=(80, 24)).columns
+            # frame is 12 chars, space separator is 1 char
+            available = max(0, width - len(frame) - 1)
+            if len(msg) > available:
+                msg = msg[: max(0, available - 3)] + "..."
+            sys.stdout.write(f"\r{frame} {msg}")
+            sys.stdout.flush()
+            frame_idx += 1
+            self._stop_event.wait(_FRAME_INTERVAL)
+
+
+_spinner = Spinner()
+atexit.register(_spinner.stop)
+
+# ---------------------------------------------------------------------------
 # Auth / client setup
 # ---------------------------------------------------------------------------
 
@@ -89,11 +162,12 @@ def api_call(fn, **kwargs) -> Any:
 
             if status == 429 or error_code == "ratelimited":
                 retry_after = int(exc.response.headers.get("Retry-After", 5))
-                print(f"  Rate limited — waiting {retry_after}s before retrying…")
+                _spinner.update(f"Rate limited — waiting {retry_after}s before retrying...")
                 time.sleep(retry_after)
                 continue
 
             if error_code in ("invalid_auth", "not_authed", "token_revoked", "token_expired"):
+                _spinner.stop()
                 print(
                     f"ERROR: Authentication failed ({error_code}).\n"
                     "Check that SLACK_USER_TOKEN in .env is correct and has not expired.",
@@ -102,6 +176,7 @@ def api_call(fn, **kwargs) -> Any:
                 sys.exit(1)
 
             if error_code == "missing_scope":
+                _spinner.stop()
                 print(
                     f"ERROR: Missing OAuth scope.\n"
                     "Ensure your token has the scopes: im:history, im:read, users:read.",
@@ -110,6 +185,7 @@ def api_call(fn, **kwargs) -> Any:
                 sys.exit(1)
 
             if error_code == "channel_not_found":
+                _spinner.stop()
                 print(
                     "ERROR: Channel not found. Use --list-dms to find valid channel IDs.",
                     file=sys.stderr,
@@ -247,49 +323,55 @@ def format_message(msg: dict, client: WebClient, prefix: str = "") -> str:
 
 
 def cmd_list_dms(client: WebClient) -> None:
-    print("Fetching DM conversations…\n")
+    _spinner.start("Loading DMs...")
     cursor = None
     rows: list[tuple[str, str, str, float]] = []
 
-    while True:
-        kwargs: dict[str, Any] = {"types": "im", "limit": MESSAGES_PER_PAGE}
-        if cursor:
-            kwargs["cursor"] = cursor
+    try:
+        while True:
+            kwargs: dict[str, Any] = {"types": "im", "limit": MESSAGES_PER_PAGE}
+            if cursor:
+                kwargs["cursor"] = cursor
 
-        resp = api_call(client.conversations_list, **kwargs)
-        channels = resp.get("channels", [])
+            resp = api_call(client.conversations_list, **kwargs)
+            channels = resp.get("channels", [])
 
-        for ch in channels:
-            ch_id = ch["id"]
-            other_user_id = ch.get("user", "")
-            if not other_user_id:
-                continue
+            for ch in channels:
+                ch_id = ch["id"]
+                other_user_id = ch.get("user", "")
+                if not other_user_id:
+                    continue
 
-            display_name = resolve_user(client, other_user_id)
+                display_name = resolve_user(client, other_user_id)
 
-            last_ts_float = 0.0
-            last_date = "unknown"
-            try:
-                hist = api_call(
-                    client.conversations_history,
-                    channel=ch_id,
-                    limit=1,
-                )
-                msgs = hist.get("messages", [])
-                if msgs:
-                    last_ts_float = float(msgs[0]["ts"])
-                    last_date = ts_to_date_str(last_ts_float)
-            except (SlackApiError, KeyError, ValueError, TypeError):
-                pass
+                last_ts_float = 0.0
+                last_date = "unknown"
+                try:
+                    hist = api_call(
+                        client.conversations_history,
+                        channel=ch_id,
+                        limit=1,
+                    )
+                    msgs = hist.get("messages", [])
+                    if msgs:
+                        last_ts_float = float(msgs[0]["ts"])
+                        last_date = ts_to_date_str(last_ts_float)
+                except (SlackApiError, KeyError, ValueError, TypeError):
+                    pass
 
+                time.sleep(REQUEST_DELAY)
+                rows.append((ch_id, display_name, last_date, last_ts_float))
+                _spinner.update(f"Loading DMs... found {len(rows)}")
+
+            next_cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not next_cursor:
+                break
+            cursor = next_cursor
             time.sleep(REQUEST_DELAY)
-            rows.append((ch_id, display_name, last_date, last_ts_float))
 
-        next_cursor = resp.get("response_metadata", {}).get("next_cursor")
-        if not next_cursor:
-            break
-        cursor = next_cursor
-        time.sleep(REQUEST_DELAY)
+        _spinner.stop(f"Found {len(rows)} DM conversation(s).")
+    finally:
+        _spinner.stop()  # no-op if already stopped cleanly; catches KeyboardInterrupt
 
     if not rows:
         print("No 1:1 DM conversations found.")
@@ -344,6 +426,22 @@ def fetch_replies(client: WebClient, channel: str, parent_ts: str) -> list[dict]
 
 
 # ---------------------------------------------------------------------------
+# Fetch thread replies for all threaded messages (two-pass approach)
+# ---------------------------------------------------------------------------
+
+
+def fetch_all_thread_replies(client: WebClient, channel: str, messages: list[dict]) -> list[dict]:
+    """Populate _replies for every threaded message; updates the spinner with i/total progress."""
+    parents = [m for m in messages if m.get("reply_count", 0) > 0]
+    total = len(parents)
+    for i, msg in enumerate(parents, 1):
+        _spinner.update(f"Fetching thread replies... {i}/{total} threads")
+        msg["_replies"] = fetch_replies(client, channel, msg["ts"])
+        time.sleep(REQUEST_DELAY)
+    return messages
+
+
+# ---------------------------------------------------------------------------
 # Fetch conversation history
 # ---------------------------------------------------------------------------
 
@@ -378,15 +476,11 @@ def fetch_history(
         messages = resp.get("messages", [])
 
         included = [m for m in messages if should_include(m)]
-        print(f"  Fetched page {page}… {len(messages)} messages ({len(included)} included)")
-
         for msg in included:
-            if msg.get("reply_count", 0) > 0:
-                msg["_replies"] = fetch_replies(client, channel, msg["ts"])
-                time.sleep(REQUEST_DELAY)
-            else:
-                msg["_replies"] = []
+            msg["_replies"] = []
             all_messages.append(msg)
+
+        _spinner.update(f"Fetching messages... {len(all_messages)} fetched")
 
         next_cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not next_cursor:
@@ -452,27 +546,37 @@ def write_export(
     oldest = from_dt.timestamp()
     latest = to_dt.timestamp()
 
-    print(f"\nFetching messages from {from_str} to {to_str}…")
-    messages = fetch_history(client, channel, oldest, latest)
+    _spinner.start(f"Fetching messages from {from_str} to {to_str}...")
+    try:
+        messages = fetch_history(client, channel, oldest, latest)
 
-    if not messages:
-        print("No messages found in the specified date range.")
-        return
+        if not messages:
+            _spinner.stop("No messages found in the specified date range.")
+            return
 
-    # Collect unique participant IDs from top-level messages and replies
-    participant_ids: set[str] = set()
-    for msg in messages:
-        uid = msg.get("user") or msg.get("bot_id")
-        if uid:
-            participant_ids.add(uid)
-        for reply in msg.get("_replies", []):
-            uid = reply.get("user") or reply.get("bot_id")
+        fetch_all_thread_replies(client, channel, messages)
+
+        # Collect unique participant IDs from top-level messages and replies
+        participant_ids: set[str] = set()
+        for msg in messages:
+            uid = msg.get("user") or msg.get("bot_id")
             if uid:
                 participant_ids.add(uid)
+            for reply in msg.get("_replies", []):
+                uid = reply.get("user") or reply.get("bot_id")
+                if uid:
+                    participant_ids.add(uid)
 
-    participants = [resolve_user(client, uid) for uid in participant_ids]
+        # NOTE: single update before a list comprehension — shows the total upfront.
+        # Fine for 1:1 DMs (2 users). If extended to group DMs/channels, replace with
+        # an explicit loop that calls _spinner.update() per resolved user.
+        _spinner.update(f"Resolving usernames... {len(participant_ids)} users")
+        participants = [resolve_user(client, uid) for uid in participant_ids]
 
-    print("\nFormatting output…")
+        _spinner.stop()
+    finally:
+        _spinner.stop()  # no-op if already stopped cleanly; catches KeyboardInterrupt
+
     text, total = build_output(messages, client, participants, from_str, to_str)
 
     EXPORT_DIR.mkdir(exist_ok=True)
