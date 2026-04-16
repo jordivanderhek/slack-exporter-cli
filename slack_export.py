@@ -646,34 +646,40 @@ def main() -> None:
 
     client = load_client()
 
-    if args.list_dms:
-        cmd_list_dms(client)
-        return
+    try:
+        if args.list_dms:
+            cmd_list_dms(client)
+            return
 
-    # Export mode
-    now_utc = datetime.now(tz=timezone.utc)
+        # Export mode
+        now_utc = datetime.now(tz=timezone.utc)
 
-    if args.from_date:
-        from_dt = parse_date(args.from_date)
-        from_str = args.from_date
-    else:
-        from_dt = (now_utc - timedelta(days=30)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        from_str = from_dt.strftime("%d-%m-%Y")
+        if args.from_date:
+            from_dt = parse_date(args.from_date)
+            from_str = args.from_date
+        else:
+            from_dt = (now_utc - timedelta(days=30)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            from_str = from_dt.strftime("%d-%m-%Y")
 
-    if args.to_date:
-        to_dt = parse_date(args.to_date).replace(hour=23, minute=59, second=59)
-        to_str = args.to_date
-    else:
-        to_dt = now_utc.replace(hour=23, minute=59, second=59, microsecond=0)
-        to_str = now_utc.strftime("%d-%m-%Y")
+        if args.to_date:
+            to_dt = parse_date(args.to_date).replace(hour=23, minute=59, second=59)
+            to_str = args.to_date
+        else:
+            to_dt = now_utc.replace(hour=23, minute=59, second=59, microsecond=0)
+            to_str = now_utc.strftime("%d-%m-%Y")
 
-    if from_dt > to_dt:
-        print("ERROR: --from date must be before --to date.", file=sys.stderr)
-        sys.exit(1)
+        if from_dt > to_dt:
+            print("ERROR: --from date must be before --to date.", file=sys.stderr)
+            sys.exit(1)
 
-    write_export(client, args.channel, from_dt, to_dt, from_str, to_str)
+        write_export(client, args.channel, from_dt, to_dt, from_str, to_str)
+
+    except KeyboardInterrupt:
+        _spinner.stop()
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":
