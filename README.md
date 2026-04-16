@@ -61,7 +61,7 @@ Found 23 conversations.
 
 ID              Name                        Type     Members  Last active
 C0123ABCDEF     #product-updates            public   34       2025-06-12
-C0456GHIJKL     #altura-client-x            connect  8        2025-06-10
+C0456GHIJKL     #acme-client-x              connect  8        2025-06-10
 G0789MNOPQR     private-leadership          private  5        2025-06-11
 G0999XYZABC     alice, bob, charlie         mpdm     3        2025-05-28
 D0123ABCDEF     @alice                      dm       2        2025-06-12
