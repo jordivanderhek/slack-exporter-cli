@@ -249,7 +249,7 @@ def format_message(msg: dict, client: WebClient, prefix: str = "") -> str:
 def cmd_list_dms(client: WebClient) -> None:
     print("Fetching DM conversations…\n")
     cursor = None
-    rows: list[tuple[str, str, str]] = []
+    rows: list[tuple[str, str, str, float]] = []
 
     while True:
         kwargs: dict[str, Any] = {"types": "im", "limit": MESSAGES_PER_PAGE}
@@ -267,16 +267,23 @@ def cmd_list_dms(client: WebClient) -> None:
 
             display_name = resolve_user(client, other_user_id)
 
-            last_ts = ch.get("last_read") or ch.get("updated")
-            if last_ts:
-                try:
-                    last_date = ts_to_date_str(float(last_ts))
-                except (ValueError, TypeError):
-                    last_date = "unknown"
-            else:
-                last_date = "unknown"
+            last_ts_float = 0.0
+            last_date = "unknown"
+            try:
+                hist = api_call(
+                    client.conversations_history,
+                    channel=ch_id,
+                    limit=1,
+                )
+                msgs = hist.get("messages", [])
+                if msgs:
+                    last_ts_float = float(msgs[0]["ts"])
+                    last_date = ts_to_date_str(last_ts_float)
+            except (SlackApiError, KeyError, ValueError, TypeError):
+                pass
 
-            rows.append((ch_id, display_name, last_date))
+            time.sleep(REQUEST_DELAY)
+            rows.append((ch_id, display_name, last_date, last_ts_float))
 
         next_cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not next_cursor:
@@ -288,13 +295,15 @@ def cmd_list_dms(client: WebClient) -> None:
         print("No 1:1 DM conversations found.")
         return
 
+    rows.sort(key=lambda r: r[3], reverse=True)
+
     # Align columns
     id_width = max(len(r[0]) for r in rows)
     name_width = max(len(r[1]) for r in rows)
 
     print(f"{'Channel ID':<{id_width}}  {'Participant':<{name_width}}  Last message")
     print("-" * (id_width + name_width + 20))
-    for ch_id, name, last_date in rows:
+    for ch_id, name, last_date, _ in rows:
         print(f"{ch_id:<{id_width}}  {name:<{name_width}}  {last_date}")
 
 
