@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-slack_export.py — Export Slack 1:1 DM conversation history to a clean text file
-optimised for use as LLM context.
+slack_export.py — Export Slack conversation history (1:1 DMs, public channels,
+private channels, MPDMs, Slack Connect) to a clean text file optimised for use
+as LLM context.
 
 Usage:
-    python slack_export.py --list-dms
-    python slack_export.py --channel D0123ABCDEF --from 01-01-2025 --to 30-06-2025
+    python slack_export.py --list
+    python slack_export.py --list-channels
+    python slack_export.py --list-dms                     # deprecated, still works
+    python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025
     python slack_export.py --channel D0123ABCDEF          # defaults to last 30 days
 """
 
@@ -56,6 +59,26 @@ SKIP_SUBTYPES = {
 INCLUDE_SUBTYPES = {None, "bot_message", "file_share"}
 
 EXPORT_DIR = Path("export")
+
+# Channel type labels (used in listings and export headers)
+TYPE_DM = "dm"
+TYPE_MPDM = "mpdm"
+TYPE_PUBLIC = "public"
+TYPE_PRIVATE = "private"
+TYPE_CONNECT = "connect"
+
+# At most this many participant names are printed in the export header;
+# the rest are summarised as "... and N others".
+MAX_PARTICIPANTS_SHOWN = 20
+
+# Full OAuth scope list (shown to the user when missing_scope fires).
+REQUIRED_SCOPES = (
+    "im:history, im:read, channels:history, channels:read, "
+    "groups:history, groups:read, mpim:history, mpim:read, users:read"
+)
+
+# Cap the rendered Name column width in the --list / --list-channels table.
+MAX_NAME_COLUMN = 40
 
 # ---------------------------------------------------------------------------
 # Spinner
@@ -177,9 +200,13 @@ def api_call(fn, **kwargs) -> Any:
 
             if error_code == "missing_scope":
                 _spinner.stop()
+                needed = exc.response.get("needed") or ""
+                hint = f" (needed: {needed})" if needed else ""
                 print(
-                    f"ERROR: Missing OAuth scope.\n"
-                    "Ensure your token has the scopes: im:history, im:read, users:read.",
+                    f"ERROR: Missing OAuth scope{hint}.\n"
+                    f"Ensure your token has the scopes: {REQUIRED_SCOPES}.\n"
+                    "After adding scopes, click 'Reinstall to Workspace' in the Slack app\n"
+                    "settings and copy the new xoxp- token into .env.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -187,7 +214,16 @@ def api_call(fn, **kwargs) -> Any:
             if error_code == "channel_not_found":
                 _spinner.stop()
                 print(
-                    "ERROR: Channel not found. Use --list-dms to find valid channel IDs.",
+                    "ERROR: Channel not found. Use --list to find valid channel IDs.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if error_code == "not_in_channel":
+                _spinner.stop()
+                print(
+                    "ERROR: Your user is not a member of this channel.\n"
+                    "Join it in Slack and retry.",
                     file=sys.stderr,
                 )
                 sys.exit(1)
@@ -223,6 +259,75 @@ def resolve_user(client: WebClient, user_id: str) -> str:
     display = f"@{name}"
     _user_cache[user_id] = display
     return display
+
+
+# ---------------------------------------------------------------------------
+# Channel classification / resolution helpers
+# ---------------------------------------------------------------------------
+
+
+def classify_channel(ch: dict) -> str:
+    """Return the display-level type label for a channel dict from the Slack API.
+
+    Slack Connect takes precedence over public/private so these channels are
+    identifiable at a glance in listings.
+    """
+    if ch.get("is_im"):
+        return TYPE_DM
+    if ch.get("is_mpim"):
+        return TYPE_MPDM
+    if ch.get("is_ext_shared") or ch.get("is_shared"):
+        return TYPE_CONNECT
+    if ch.get("is_private"):
+        return TYPE_PRIVATE
+    return TYPE_PUBLIC
+
+
+def fetch_channel_members(client: WebClient, channel_id: str) -> list[str]:
+    """Return all member user IDs for a channel, paginating as needed."""
+    ids: list[str] = []
+    cursor: str | None = None
+    while True:
+        kwargs: dict[str, Any] = {"channel": channel_id, "limit": MESSAGES_PER_PAGE}
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = api_call(client.conversations_members, **kwargs)
+        ids.extend(resp.get("members", []))
+        cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not cursor:
+            break
+        time.sleep(REQUEST_DELAY)
+    return ids
+
+
+def resolve_channel_info(client: WebClient, channel_id: str) -> dict:
+    """Fetch and classify a single channel for the export path.
+
+    Returns a dict: {id, type, display_name, is_archived, raw}.
+    - DM    -> display_name = @otheruser
+    - MPDM  -> display_name = "Group DM" (members are listed in the export header)
+    - public/private/connect -> display_name = #channelname
+    """
+    resp = api_call(client.conversations_info, channel=channel_id)
+    ch = resp["channel"]
+    ch_type = classify_channel(ch)
+    is_archived = bool(ch.get("is_archived"))
+
+    if ch_type == TYPE_DM:
+        other_id = ch.get("user", "")
+        display = resolve_user(client, other_id) if other_id else channel_id
+    elif ch_type == TYPE_MPDM:
+        display = "Group DM"
+    else:
+        display = f"#{ch.get('name') or channel_id}"
+
+    return {
+        "id": channel_id,
+        "type": ch_type,
+        "display_name": display,
+        "is_archived": is_archived,
+        "raw": ch,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -318,75 +423,297 @@ def format_message(msg: dict, client: WebClient, prefix: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# --list-dms
+# List commands (--list-dms / --list-channels / --list)
 # ---------------------------------------------------------------------------
 
 
-def cmd_list_dms(client: WebClient) -> None:
-    _spinner.start("Loading DMs...")
-    cursor = None
-    rows: list[tuple[str, str, str, float]] = []
+def _last_active_from_channel(
+    client: WebClient, ch: dict, ch_type: str
+) -> tuple[str, float]:
+    """Derive ('YYYY-MM-DD', sort_ts) for the Last active column.
 
+    Uses the `updated` field (milliseconds epoch) already present in the
+    conversations.list response for non-DM channels. Falls back to a single
+    conversations.history(limit=1) call when `updated` is missing/zero, or for
+    DMs (where `updated` reflects metadata changes rather than last message).
+    """
+    updated_ms = ch.get("updated")
+    if ch_type != TYPE_DM and updated_ms:
+        last_ts = float(updated_ms) / 1000.0
+        return ts_to_date_str(last_ts), last_ts
+
+    ch_id = ch["id"]
     try:
-        while True:
-            kwargs: dict[str, Any] = {"types": "im", "limit": MESSAGES_PER_PAGE}
-            if cursor:
-                kwargs["cursor"] = cursor
+        hist = api_call(client.conversations_history, channel=ch_id, limit=1)
+        msgs = hist.get("messages", [])
+        if msgs:
+            last_ts = float(msgs[0]["ts"])
+            return ts_to_date_str(last_ts), last_ts
+    except (SlackApiError, KeyError, ValueError, TypeError):
+        pass
+    finally:
+        time.sleep(REQUEST_DELAY)
+    return "unknown", 0.0
 
-            resp = api_call(client.conversations_list, **kwargs)
-            channels = resp.get("channels", [])
 
-            for ch in channels:
-                ch_id = ch["id"]
-                other_user_id = ch.get("user", "")
-                if not other_user_id:
-                    continue
+def _row_for_channel(client: WebClient, ch: dict) -> dict | None:
+    """Build a normalised row dict for one channel from conversations.list.
 
-                display_name = resolve_user(client, other_user_id)
+    Returns None for DM entries with no other user (should not happen in
+    practice, but defensive).
+    """
+    ch_id = ch["id"]
+    ch_type = classify_channel(ch)
+    is_archived = bool(ch.get("is_archived"))
 
-                last_ts_float = 0.0
-                last_date = "unknown"
-                try:
-                    hist = api_call(
-                        client.conversations_history,
-                        channel=ch_id,
-                        limit=1,
-                    )
-                    msgs = hist.get("messages", [])
-                    if msgs:
-                        last_ts_float = float(msgs[0]["ts"])
-                        last_date = ts_to_date_str(last_ts_float)
-                except (SlackApiError, KeyError, ValueError, TypeError):
-                    pass
+    if ch_type == TYPE_DM:
+        other_id = ch.get("user", "")
+        if not other_id:
+            return None
+        name = resolve_user(client, other_id)
+        members = 2
+    elif ch_type == TYPE_MPDM:
+        member_ids = fetch_channel_members(client, ch_id)
+        names = [resolve_user(client, uid).lstrip("@") for uid in member_ids]
+        name = ", ".join(names)
+        members = ch.get("num_members", len(member_ids))
+    else:
+        base_name = ch.get("name") or ch_id
+        name = f"#{base_name}"
+        if is_archived:
+            name = f"{name} (archived)"
+        members = ch.get("num_members", 0)
 
-                time.sleep(REQUEST_DELAY)
-                rows.append((ch_id, display_name, last_date, last_ts_float))
-                _spinner.update(f"Loading DMs... found {len(rows)}")
+    last_date, last_ts = _last_active_from_channel(client, ch, ch_type)
 
-            next_cursor = resp.get("response_metadata", {}).get("next_cursor")
-            if not next_cursor:
-                break
-            cursor = next_cursor
-            time.sleep(REQUEST_DELAY)
+    return {
+        "id": ch_id,
+        "name": name,
+        "type": ch_type,
+        "members": members,
+        "last_date": last_date,
+        "last_ts": last_ts,
+    }
 
+
+# User-facing type label -> Slack API `types` token.
+# `connect` is not a real API type: Slack Connect channels come through as
+# public_channel or private_channel with is_ext_shared/is_shared set, so we
+# request both and post-filter.
+_TYPE_LABEL_TO_API: dict[str, tuple[str, ...]] = {
+    TYPE_DM: ("im",),
+    TYPE_PUBLIC: ("public_channel",),
+    TYPE_PRIVATE: ("private_channel",),
+    TYPE_MPDM: ("mpim",),
+    TYPE_CONNECT: ("public_channel", "private_channel"),
+}
+
+_VALID_TYPE_LABELS = tuple(_TYPE_LABEL_TO_API.keys())
+
+
+def _resolve_type_filter(
+    spec: str | None, default_labels: set[str]
+) -> tuple[str, set[str]]:
+    """Parse a --type spec into (api_types_string, allowed_label_set).
+
+    `spec` is a comma-separated user-facing string ("public,mpdm"). Unknown
+    tokens exit the process with a clear error. Returns the API `types`
+    parameter (comma-joined, deduplicated) plus the set of labels used for
+    post-filtering.
+    """
+    if not spec:
+        labels = set(default_labels)
+    else:
+        raw = [t.strip().lower() for t in spec.split(",") if t.strip()]
+        unknown = [t for t in raw if t not in _TYPE_LABEL_TO_API]
+        if unknown:
+            print(
+                f"ERROR: Unknown type(s): {', '.join(unknown)}.\n"
+                f"Valid values: {', '.join(_VALID_TYPE_LABELS)}.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        labels = set(raw)
+        # Every --type value must be a subset of what the caller allows (e.g.
+        # --list-channels can't surface DMs).
+        disallowed = labels - default_labels
+        if disallowed:
+            print(
+                f"ERROR: Type(s) {', '.join(sorted(disallowed))} are not "
+                "available for this command.\n"
+                f"Allowed here: {', '.join(sorted(default_labels))}.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    api_types: list[str] = []
+    for label in labels:
+        for api_token in _TYPE_LABEL_TO_API[label]:
+            if api_token not in api_types:
+                api_types.append(api_token)
+
+    return ",".join(api_types), labels
+
+
+def _fetch_channel_rows(
+    client: WebClient,
+    types: str,
+    spinner_label: str,
+    allowed_labels: set[str] | None = None,
+) -> list[dict]:
+    """Paginate conversations.list and build normalised rows for all channels.
+
+    When `allowed_labels` is provided, rows whose classified type is not in
+    the set are skipped (used by the --type filter, and by `connect` which
+    must be post-filtered since Slack has no dedicated API type for it).
+    """
+    rows: list[dict] = []
+    cursor: str | None = None
+
+    while True:
+        kwargs: dict[str, Any] = {
+            "types": types,
+            "limit": MESSAGES_PER_PAGE,
+            "exclude_archived": False,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+
+        resp = api_call(client.conversations_list, **kwargs)
+        channels = resp.get("channels", [])
+
+        for ch in channels:
+            if allowed_labels is not None and classify_channel(ch) not in allowed_labels:
+                continue
+            row = _row_for_channel(client, ch)
+            if row is None:
+                continue
+            rows.append(row)
+            _spinner.update(f"{spinner_label} found {len(rows)}")
+
+        next_cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = next_cursor
+        time.sleep(REQUEST_DELAY)
+
+    return rows
+
+
+def _truncate(text: str, width: int) -> str:
+    """Truncate `text` to `width` characters, appending '...' if shortened."""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def cmd_list_dms(client: WebClient) -> None:
+    """Legacy listing — 1:1 DMs only, in the original two-column format."""
+    print("Note: --list-dms is deprecated; use --list instead.")
+
+    _spinner.start("Loading DMs...")
+    try:
+        rows = _fetch_channel_rows(client, types="im", spinner_label="Loading DMs...")
         _spinner.stop(f"Found {len(rows)} DM conversation(s).")
     finally:
-        _spinner.stop()  # no-op if already stopped cleanly; catches KeyboardInterrupt
+        _spinner.stop()
 
     if not rows:
         print("No 1:1 DM conversations found.")
         return
 
-    rows.sort(key=lambda r: r[3], reverse=True)
+    rows.sort(key=lambda r: r["last_ts"], reverse=True)
 
-    # Align columns
-    id_width = max(len(r[0]) for r in rows)
-    name_width = max(len(r[1]) for r in rows)
+    id_width = max(len(r["id"]) for r in rows)
+    name_width = max(len(r["name"]) for r in rows)
 
     print(f"{'Channel ID':<{id_width}}  {'Participant':<{name_width}}  Last message")
     print("-" * (id_width + name_width + 20))
-    for ch_id, name, last_date, _ in rows:
-        print(f"{ch_id:<{id_width}}  {name:<{name_width}}  {last_date}")
+    for r in rows:
+        print(
+            f"{r['id']:<{id_width}}  {r['name']:<{name_width}}  {r['last_date']}"
+        )
+
+
+def _print_channel_table(rows: list[dict], noun: str) -> None:
+    """Render rows with the unified ID / Name / Type / Members / Last active columns."""
+    if not rows:
+        print(f"No {noun} found.")
+        return
+
+    rows.sort(key=lambda r: r["last_ts"], reverse=True)
+
+    # Clamp the Name column for long MPDM member lists.
+    for r in rows:
+        r["_name_display"] = _truncate(r["name"], MAX_NAME_COLUMN)
+
+    id_width = max(len("ID"), max(len(r["id"]) for r in rows))
+    name_width = max(len("Name"), max(len(r["_name_display"]) for r in rows))
+    type_width = max(len("Type"), max(len(r["type"]) for r in rows))
+    members_width = max(len("Members"), max(len(str(r["members"])) for r in rows))
+
+    print(f"Found {len(rows)} {noun}.\n")
+    header = (
+        f"{'ID':<{id_width}}  {'Name':<{name_width}}  "
+        f"{'Type':<{type_width}}  {'Members':<{members_width}}  Last active"
+    )
+    print(header)
+    for r in rows:
+        print(
+            f"{r['id']:<{id_width}}  {r['_name_display']:<{name_width}}  "
+            f"{r['type']:<{type_width}}  {str(r['members']):<{members_width}}  "
+            f"{r['last_date']}"
+        )
+
+
+def cmd_list_channels(client: WebClient, type_filter: str | None = None) -> None:
+    """List public, private, and multi-party DM channels (no 1:1 DMs).
+
+    `type_filter` is an optional comma-separated subset of
+    {public, private, mpdm, connect}.
+    """
+    defaults = {TYPE_PUBLIC, TYPE_PRIVATE, TYPE_MPDM, TYPE_CONNECT}
+    api_types, allowed = _resolve_type_filter(type_filter, defaults)
+
+    _spinner.start("Loading channels...")
+    try:
+        rows = _fetch_channel_rows(
+            client,
+            types=api_types,
+            spinner_label="Loading channels...",
+            allowed_labels=allowed,
+        )
+        _spinner.stop()
+    finally:
+        _spinner.stop()
+
+    _print_channel_table(rows, noun="channels")
+
+
+def cmd_list(client: WebClient, type_filter: str | None = None) -> None:
+    """List every conversation the user belongs to (DMs + channels + MPDMs).
+
+    `type_filter` is an optional comma-separated subset of
+    {dm, public, private, mpdm, connect}.
+    """
+    defaults = {TYPE_DM, TYPE_PUBLIC, TYPE_PRIVATE, TYPE_MPDM, TYPE_CONNECT}
+    api_types, allowed = _resolve_type_filter(type_filter, defaults)
+
+    _spinner.start("Loading conversations...")
+    try:
+        rows = _fetch_channel_rows(
+            client,
+            types=api_types,
+            spinner_label="Loading conversations...",
+            allowed_labels=allowed,
+        )
+        _spinner.stop()
+    finally:
+        _spinner.stop()
+
+    _print_channel_table(rows, noun="conversations")
 
 
 # ---------------------------------------------------------------------------
@@ -499,12 +826,24 @@ def fetch_history(
 # ---------------------------------------------------------------------------
 
 
+def _format_participants(participants: list[str]) -> str:
+    """Render the Participants line, capping at MAX_PARTICIPANTS_SHOWN names."""
+    sorted_p = sorted(set(participants))
+    if len(sorted_p) > MAX_PARTICIPANTS_SHOWN:
+        shown = ", ".join(sorted_p[:MAX_PARTICIPANTS_SHOWN])
+        others = len(sorted_p) - MAX_PARTICIPANTS_SHOWN
+        return f"{shown}, ... and {others} others"
+    return ", ".join(sorted_p)
+
+
 def build_output(
     messages: list[dict],
     client: WebClient,
     participants: list[str],
     from_str: str,
     to_str: str,
+    channel_type: str,
+    channel_display_name: str,
 ) -> tuple[str, int]:
     """
     Build the full export text. Returns (text, total_message_count).
@@ -523,13 +862,17 @@ def build_output(
             lines.append(reply_line)
             total += 1
 
-    participant_str = ", ".join(sorted(set(participants)))
-    header = (
-        "=== Slack DM Export ===\n"
-        f"Participants: {participant_str}\n"
-        f"Period: {from_str} to {to_str}\n"
-        f"Total messages: {total}\n"
-    )
+    header_lines = ["=== Slack Export ==="]
+    if channel_type != TYPE_DM:
+        header_lines.append(
+            f"Channel: {channel_display_name} ({channel_type})"
+        )
+    header_lines += [
+        f"Participants: {_format_participants(participants)}",
+        f"Period: {from_str} to {to_str}",
+        f"Total messages: {total:,}",
+    ]
+    header = "\n".join(header_lines) + "\n"
 
     body = "\n".join(lines)
     return header + "\n" + body + "\n", total
@@ -546,6 +889,20 @@ def write_export(
     oldest = from_dt.timestamp()
     latest = to_dt.timestamp()
 
+    # Resolve channel metadata up-front so we know the type / archived state.
+    _spinner.start(f"Resolving channel {channel}...")
+    try:
+        info = resolve_channel_info(client, channel)
+        _spinner.stop()
+    finally:
+        _spinner.stop()
+
+    if info["is_archived"]:
+        print("Note: this channel is archived. Proceeding with export.")
+
+    channel_type = info["type"]
+    channel_display_name = info["display_name"]
+
     _spinner.start(f"Fetching messages from {from_str} to {to_str}...")
     try:
         messages = fetch_history(client, channel, oldest, latest)
@@ -556,28 +913,44 @@ def write_export(
 
         fetch_all_thread_replies(client, channel, messages)
 
-        # Collect unique participant IDs from top-level messages and replies
+        # Participant IDs:
+        # - DMs: derived from message authors (matches existing behaviour).
+        # - Channels / MPDMs: full member list from conversations.members so the
+        #   header reflects the channel roster, not just active authors.
         participant_ids: set[str] = set()
-        for msg in messages:
-            uid = msg.get("user") or msg.get("bot_id")
-            if uid:
-                participant_ids.add(uid)
-            for reply in msg.get("_replies", []):
-                uid = reply.get("user") or reply.get("bot_id")
+        if channel_type == TYPE_DM:
+            for msg in messages:
+                uid = msg.get("user") or msg.get("bot_id")
                 if uid:
                     participant_ids.add(uid)
+                for reply in msg.get("_replies", []):
+                    uid = reply.get("user") or reply.get("bot_id")
+                    if uid:
+                        participant_ids.add(uid)
+        else:
+            _spinner.update("Fetching channel members...")
+            participant_ids.update(fetch_channel_members(client, channel))
 
-        # NOTE: single update before a list comprehension — shows the total upfront.
-        # Fine for 1:1 DMs (2 users). If extended to group DMs/channels, replace with
-        # an explicit loop that calls _spinner.update() per resolved user.
-        _spinner.update(f"Resolving usernames... {len(participant_ids)} users")
-        participants = [resolve_user(client, uid) for uid in participant_ids]
+        participant_ids_list = list(participant_ids)
+        total_users = len(participant_ids_list)
+        participants: list[str] = []
+        for i, uid in enumerate(participant_ids_list, 1):
+            _spinner.update(f"Resolving usernames... {i}/{total_users} users")
+            participants.append(resolve_user(client, uid))
 
         _spinner.stop()
     finally:
         _spinner.stop()  # no-op if already stopped cleanly; catches KeyboardInterrupt
 
-    text, total = build_output(messages, client, participants, from_str, to_str)
+    text, total = build_output(
+        messages,
+        client,
+        participants,
+        from_str,
+        to_str,
+        channel_type,
+        channel_display_name,
+    )
 
     EXPORT_DIR.mkdir(exist_ok=True)
     filename = f"{channel}_{from_str}_{to_str}.txt"
@@ -585,13 +958,17 @@ def write_export(
 
     output_path.write_text(text, encoding="utf-8")
 
-    participant_str = ", ".join(sorted(set(participants)))
+    summary_channel = (
+        channel_display_name if channel_type == TYPE_DM
+        else f"{channel_display_name} ({channel_type})"
+    )
     print(
         f"\nExport complete.\n"
         f"  File:           {output_path}\n"
-        f"  Participants:   {participant_str}\n"
+        f"  Channel:        {summary_channel}\n"
+        f"  Participants:   {_format_participants(participants)}\n"
         f"  Date range:     {from_str} → {to_str}\n"
-        f"  Total messages: {total}"
+        f"  Total messages: {total:,}"
     )
 
 
@@ -602,24 +979,57 @@ def write_export(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export Slack 1:1 DM history to a text file optimised for LLM context.",
+        description=(
+            "Export Slack conversation history (DMs, public/private channels, "
+            "MPDMs, Slack Connect) to a text file optimised for LLM context."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python slack_export.py --list-dms\n"
-            "  python slack_export.py --channel D0123ABCDEF --from 01-01-2025 --to 30-06-2025\n"
+            "  python slack_export.py --list\n"
+            "  python slack_export.py --list --type public,private\n"
+            "  python slack_export.py --list-channels --type connect\n"
+            "  python slack_export.py --list-channels --type mpdm\n"
+            "  python slack_export.py --list-dms                       # deprecated\n"
+            "  python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025\n"
+            "  python slack_export.py --channel G0999XYZABC            # MPDM, last 30 days\n"
             "  python slack_export.py --channel D0123ABCDEF\n"
         ),
     )
     parser.add_argument(
+        "--list",
+        dest="list_all",
+        action="store_true",
+        help="List every conversation you belong to (DMs, channels, MPDMs, Slack Connect).",
+    )
+    parser.add_argument(
+        "--list-channels",
+        action="store_true",
+        help="List public, private, and multi-party DM channels (no 1:1 DMs).",
+    )
+    parser.add_argument(
         "--list-dms",
         action="store_true",
-        help="List all 1:1 DM conversations with participant names and last message date.",
+        help="[Deprecated] List only 1:1 DMs. Use --list instead.",
+    )
+    parser.add_argument(
+        "--type",
+        dest="type_filter",
+        metavar="TYPES",
+        help=(
+            "Comma-separated filter for --list / --list-channels. "
+            "Values: dm, public, private, mpdm, connect "
+            "(e.g. --type public,connect). "
+            "Defaults: --list shows all types; --list-channels shows all non-DM types."
+        ),
     )
     parser.add_argument(
         "--channel",
         metavar="CHANNEL_ID",
-        help="Slack DM channel ID to export (e.g. D0123ABCDEF).",
+        help=(
+            "Slack conversation ID to export (D.../C.../G...). "
+            "Accepts DMs, public/private channels, MPDMs, and Slack Connect channels."
+        ),
     )
     parser.add_argument(
         "--from",
@@ -640,13 +1050,34 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not args.list_dms and not args.channel:
+    list_flags = [args.list_all, args.list_channels, args.list_dms]
+    if sum(1 for f in list_flags if f) > 1:
+        print(
+            "ERROR: Pass only one of --list, --list-channels, --list-dms.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if not any(list_flags) and not args.channel:
         parser.print_help()
         sys.exit(0)
+
+    if args.type_filter and not (args.list_all or args.list_channels):
+        print(
+            "ERROR: --type only applies to --list or --list-channels.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     client = load_client()
 
     try:
+        if args.list_all:
+            cmd_list(client, type_filter=args.type_filter)
+            return
+        if args.list_channels:
+            cmd_list_channels(client, type_filter=args.type_filter)
+            return
         if args.list_dms:
             cmd_list_dms(client)
             return
