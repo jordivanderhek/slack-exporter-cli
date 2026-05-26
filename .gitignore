@@ -1,9 +1,14 @@
 .env
 export/*
 !export/.gitkeep
+snapshots/*
+!snapshots/.gitkeep
 __pycache__/
 *.pyc
 *.pyo
 .venv/
 venv/
 .DS_Store
+
+# Specific to this project
+Docs/Specs/

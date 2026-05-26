@@ -12,12 +12,15 @@ Usage:
     python slack_export.py --list-user "Alice Johnson"
     python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025
     python slack_export.py --channel D0123ABCDEF          # defaults to last 30 days
+    python slack_export.py --diary --dry-run
+    python slack_export.py --diary --from 01-04-2026 --to 24-04-2026 --dry-run
 """
 
 from __future__ import annotations
 
 import argparse
 import atexit
+import json
 import os
 import re
 import shutil
@@ -26,7 +29,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TextIO
 
 from dotenv import load_dotenv
 from slack_sdk import WebClient
@@ -62,6 +65,7 @@ SKIP_SUBTYPES = {
 INCLUDE_SUBTYPES = {None, "bot_message", "file_share"}
 
 EXPORT_DIR = Path("export")
+SNAPSHOTS_DIR = Path("snapshots")
 
 # Channel type labels (used in listings and export headers)
 TYPE_DM = "dm"
@@ -83,6 +87,13 @@ REQUIRED_SCOPES = (
 # Cap the rendered Name column width in the --list / --list-channels table.
 MAX_NAME_COLUMN = 40
 
+# `--diary` without a date: argparse sets this sentinel (today 00:00 UTC → now).
+DIARY_ROLLING = "__rolling__"
+
+# Populate after a dry-run by inspecting which user IDs consistently emit bot or
+# integration noise (Linear, GitHub, calendar bots, workflows). Expected to grow.
+KNOWN_BOT_USER_IDS: set[str] = set()
+
 # ---------------------------------------------------------------------------
 # Spinner
 # ---------------------------------------------------------------------------
@@ -100,7 +111,8 @@ _FRAME_INTERVAL = 0.08  # seconds
 class Spinner:
     """Bouncing-bar progress indicator that runs on a background thread."""
 
-    def __init__(self) -> None:
+    def __init__(self, stream: TextIO | None = None) -> None:
+        self._stream = stream if stream is not None else sys.stdout
         self._thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._message = ""
@@ -128,10 +140,10 @@ class Spinner:
             self._thread.join()
             self._thread = None
         width = shutil.get_terminal_size(fallback=(80, 24)).columns
-        sys.stdout.write("\r" + " " * width + "\r")
-        sys.stdout.flush()
+        self._stream.write("\r" + " " * width + "\r")
+        self._stream.flush()
         if final_message:
-            print(final_message)
+            print(final_message, file=self._stream)
 
     def _spin(self) -> None:
         frame_idx = 0
@@ -144,14 +156,16 @@ class Spinner:
             available = max(0, width - len(frame) - 1)
             if len(msg) > available:
                 msg = msg[: max(0, available - 3)] + "..."
-            sys.stdout.write(f"\r{frame} {msg}")
-            sys.stdout.flush()
+            self._stream.write(f"\r{frame} {msg}")
+            self._stream.flush()
             frame_idx += 1
             self._stop_event.wait(_FRAME_INTERVAL)
 
 
 _spinner = Spinner()
+_diary_spinner = Spinner(stream=sys.stderr)
 atexit.register(_spinner.stop)
+atexit.register(_diary_spinner.stop)
 
 # ---------------------------------------------------------------------------
 # Auth / client setup
@@ -486,6 +500,8 @@ def ts_to_date_str(unix_ts: float) -> str:
 # ---------------------------------------------------------------------------
 
 SKIP_SUBTYPES_SET = frozenset(SKIP_SUBTYPES)
+
+SLACK_CONNECT_ZERO_SUBTYPES = frozenset({"sh_room_created", "sh_room_shared"})
 
 
 def should_include(msg: dict) -> bool:
@@ -913,8 +929,15 @@ def cmd_list_user(client: WebClient, user_input: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fetch_replies(client: WebClient, channel: str, parent_ts: str) -> list[dict]:
+def fetch_replies(
+    client: WebClient,
+    channel: str,
+    parent_ts: str,
+    *,
+    message_filter: Callable[[dict], bool] | None = None,
+) -> list[dict]:
     """Fetch all replies for a thread (excludes the parent message at index 0)."""
+    pred = message_filter if message_filter is not None else should_include
     replies: list[dict] = []
     cursor = None
 
@@ -932,7 +955,7 @@ def fetch_replies(client: WebClient, channel: str, parent_ts: str) -> list[dict]
 
         # Index 0 is the parent message — skip it
         for msg in messages[1:]:
-            if should_include(msg):
+            if pred(msg):
                 replies.append(msg)
 
         next_cursor = resp.get("response_metadata", {}).get("next_cursor")
@@ -949,13 +972,23 @@ def fetch_replies(client: WebClient, channel: str, parent_ts: str) -> list[dict]
 # ---------------------------------------------------------------------------
 
 
-def fetch_all_thread_replies(client: WebClient, channel: str, messages: list[dict]) -> list[dict]:
+def fetch_all_thread_replies(
+    client: WebClient,
+    channel: str,
+    messages: list[dict],
+    *,
+    message_filter: Callable[[dict], bool] | None = None,
+    spinner: Spinner | None = None,
+) -> list[dict]:
     """Populate _replies for every threaded message; updates the spinner with i/total progress."""
+    spin = spinner if spinner is not None else _spinner
     parents = [m for m in messages if m.get("reply_count", 0) > 0]
     total = len(parents)
     for i, msg in enumerate(parents, 1):
-        _spinner.update(f"Fetching thread replies... {i}/{total} threads")
-        msg["_replies"] = fetch_replies(client, channel, msg["ts"])
+        spin.update(f"Fetching thread replies... {i}/{total} threads")
+        msg["_replies"] = fetch_replies(
+            client, channel, msg["ts"], message_filter=message_filter
+        )
         time.sleep(REQUEST_DELAY)
     return messages
 
@@ -970,12 +1003,18 @@ def fetch_history(
     channel: str,
     oldest: float,
     latest: float,
+    *,
+    message_filter: Callable[[dict], bool] | None = None,
+    spinner: Spinner | None = None,
+    progress_prefix: str | None = None,
 ) -> list[dict]:
     """
     Fetch all messages in [oldest, latest] from conversations.history.
     Returns a flat list of message dicts; thread replies are embedded under
     each parent as msg["_replies"].
     """
+    pred = message_filter if message_filter is not None else should_include
+    spin = spinner if spinner is not None else _spinner
     all_messages: list[dict] = []
     cursor = None
     page = 1
@@ -994,12 +1033,15 @@ def fetch_history(
         resp = api_call(client.conversations_history, **kwargs)
         messages = resp.get("messages", [])
 
-        included = [m for m in messages if should_include(m)]
+        included = [m for m in messages if pred(m)]
         for msg in included:
             msg["_replies"] = []
             all_messages.append(msg)
 
-        _spinner.update(f"Fetching messages... {len(all_messages)} fetched")
+        if progress_prefix:
+            spin.update(f"{progress_prefix} — {len(all_messages)} fetched")
+        else:
+            spin.update(f"Fetching messages... {len(all_messages)} fetched")
 
         next_cursor = resp.get("response_metadata", {}).get("next_cursor")
         if not next_cursor:
@@ -1014,8 +1056,602 @@ def fetch_history(
 
 
 # ---------------------------------------------------------------------------
-# Format and write output
+# Diary dry-run (phase 1)
 # ---------------------------------------------------------------------------
+
+DIARY_ALL_MESSAGES: Callable[[dict], bool] = lambda _m: True
+
+_URL_ONLY_RE = re.compile(r"https?://[^\s<>()\[\]{}]+")
+_EMOJI_SHORTCODE_RE = re.compile(r"^:[a-z0-9_+-]+:$")
+
+
+def _dt_iso_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    s = dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return s.replace("+00:00", "Z")
+
+
+def _msg_iso_ts(ts_str: str) -> str:
+    return _dt_iso_z(datetime.fromtimestamp(float(ts_str), tz=timezone.utc))
+
+
+def diary_is_zero_quality(msg: dict) -> bool:
+    if msg.get("subtype") == "bot_message" or msg.get("bot_id"):
+        return True
+    st = msg.get("subtype")
+    if st in SKIP_SUBTYPES_SET or st in SLACK_CONNECT_ZERO_SUBTYPES:
+        return True
+    if st is not None and st not in INCLUDE_SUBTYPES:
+        return True
+    uid = msg.get("user")
+    if uid and uid in KNOWN_BOT_USER_IDS:
+        return True
+    if msg.get("app_id") and not uid:
+        return True
+    return False
+
+
+def _diary_core_text(msg: dict) -> str:
+    return (msg.get("text") or "").strip()
+
+
+def _diary_is_url_only(msg: dict) -> bool:
+    s = _diary_core_text(msg)
+    if not s:
+        return False
+    remainder = _URL_ONLY_RE.sub("", s).strip()
+    return bool(_URL_ONLY_RE.search(s)) and remainder == ""
+
+
+def _diary_is_single_emoji_text(text: str) -> bool:
+    s = text.strip()
+    if not s:
+        return False
+    if _EMOJI_SHORTCODE_RE.fullmatch(s):
+        return True
+    if any(c.isalnum() for c in s):
+        return False
+    return 1 <= len(s) <= 8
+
+
+def _diary_file_share_no_text(msg: dict) -> bool:
+    if msg.get("subtype") != "file_share":
+        return False
+    return len(_diary_core_text(msg)) == 0
+
+
+def _count_raw_tree(messages: list[dict]) -> int:
+    n = 0
+    for m in messages:
+        n += 1
+        n += len(m.get("_replies", []))
+    return n
+
+
+def diary_filter_zero_quality(messages: list[dict]) -> tuple[list[dict], int]:
+    """Remove zero-quality messages; returns (tree, num_dropped)."""
+    dropped = 0
+    out: list[dict] = []
+    for msg in messages:
+        if diary_is_zero_quality(msg):
+            dropped += 1
+            continue
+        kept_replies: list[dict] = []
+        for r in msg.get("_replies", []):
+            if diary_is_zero_quality(r):
+                dropped += 1
+            else:
+                kept_replies.append(r)
+        msg["_replies"] = kept_replies
+        out.append(msg)
+    return out, dropped
+
+
+def diary_classify_message(
+    msg: dict,
+    *,
+    channel_is_dm: bool,
+    is_reply: bool,
+    parent_filtered_reply_count: int,
+) -> str:
+    if channel_is_dm:
+        return "high"
+    if _diary_file_share_no_text(msg):
+        return "low"
+    if _diary_is_url_only(msg):
+        return "low"
+    if _diary_is_single_emoji_text(msg.get("text") or ""):
+        return "low"
+    text_len = len(_diary_core_text(msg))
+    if not is_reply:
+        if parent_filtered_reply_count >= 3:
+            return "high"
+        if text_len < 15:
+            return "low"
+        if text_len <= 100:
+            return "medium"
+        return "high"
+    if parent_filtered_reply_count >= 3:
+        if text_len < 15:
+            return "low"
+        if text_len <= 100:
+            return "medium"
+        return "high"
+    if text_len < 15:
+        return "low"
+    if text_len <= 100:
+        return "medium"
+    return "high"
+
+
+def diary_apply_signal_labels(
+    messages: list[dict],
+    *,
+    channel_is_dm: bool,
+) -> None:
+    for msg in messages:
+        nrep = len(msg.get("_replies", []))
+        msg["_signal_quality"] = diary_classify_message(
+            msg,
+            channel_is_dm=channel_is_dm,
+            is_reply=False,
+            parent_filtered_reply_count=nrep,
+        )
+        for reply in msg.get("_replies", []):
+            reply["_signal_quality"] = diary_classify_message(
+                reply,
+                channel_is_dm=channel_is_dm,
+                is_reply=True,
+                parent_filtered_reply_count=nrep,
+            )
+
+
+def _flatten_signal_counts(
+    messages: list[dict],
+) -> tuple[int, int, int, int, set[str], bool]:
+    """Returns high_ct, medium_ct, low_ct, total, human_authors, has_threads."""
+    high_ct = medium_ct = low_ct = 0
+    authors: set[str] = set()
+    has_threads = False
+    total = 0
+
+    def walk(msg: dict) -> None:
+        nonlocal high_ct, medium_ct, low_ct, has_threads, total
+        total += 1
+        uid = msg.get("user")
+        if uid:
+            authors.add(uid)
+        sq = msg.get("_signal_quality", "low")
+        if sq == "high":
+            high_ct += 1
+        elif sq == "medium":
+            medium_ct += 1
+        else:
+            low_ct += 1
+        replies = msg.get("_replies", [])
+        if replies:
+            has_threads = True
+        for r in replies:
+            walk(r)
+
+    for m in messages:
+        walk(m)
+    return high_ct, medium_ct, low_ct, total, authors, has_threads
+
+
+def _deep_thread_reply_max(messages: list[dict]) -> int:
+    best = 0
+    for msg in messages:
+        n = len(msg.get("_replies", []))
+        if n > best:
+            best = n
+    return best
+
+
+def diary_classify_conversation(
+    messages: list[dict],
+    *,
+    channel_type: str,
+    auth_user_id: str,
+    dm_peer_id: str | None,
+) -> tuple[str, str]:
+    """Return (tier, reason) with tier in high|medium|low|skip."""
+    if not messages:
+        return "skip", "all messages filtered as zero quality"
+
+    high_ct, medium_ct, low_ct, total, authors, has_threads = _flatten_signal_counts(
+        messages
+    )
+
+    # --- high tier (first match wins) ---
+    if channel_type == TYPE_DM and dm_peer_id:
+        if auth_user_id in authors and dm_peer_id in authors:
+            return "high", "1:1 DM with messages from both participants"
+    if len(authors) >= 3:
+        return "high", "3+ distinct human authors"
+    if _deep_thread_reply_max(messages) >= 3:
+        return "high", "thread with 3+ replies"
+    if high_ct >= 3:
+        return "high", "3+ high-quality messages"
+
+    # --- medium ---
+    if high_ct >= 1:
+        return "medium", "contains at least one high-quality message"
+    if medium_ct >= 5:
+        return "medium", "5+ medium-quality messages"
+    if channel_type == TYPE_MPDM and len(authors) >= 2:
+        return "medium", "MPDM with 2+ active participants"
+
+    # --- low ---
+    if low_ct == total:
+        return "low", "only low-quality messages"
+    if total == 1:
+        return "low", "single message in window"
+    if len(authors) <= 1:
+        return "low", "single author"
+
+    return "low", "default"
+
+
+def fetch_diary_active_conversations(
+    client: WebClient,
+    window_start_ts: float,
+    spinner: Spinner,
+) -> tuple[list[dict], int]:
+    """Paginate conversations.list (recent-first) and stop when `updated` < window.
+
+    For 1:1 DMs (`im`), Slack's `updated` can lag behind real message activity.
+    If dry-run omits DMs that clearly had traffic in the window, investigate here
+    before changing filters or stop rules.
+    """
+    active: list[dict] = []
+    scanned = 0
+    cursor: str | None = None
+    types = "im,public_channel,private_channel,mpim"
+
+    while True:
+        kwargs: dict[str, Any] = {
+            "types": types,
+            "limit": MESSAGES_PER_PAGE,
+            "exclude_archived": True,
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+
+        resp = api_call(client.conversations_list, **kwargs)
+        channels = resp.get("channels", [])
+
+        stop_paging = False
+        for ch in channels:
+            scanned += 1
+            updated_ms = ch.get("updated") or 0
+            updated_sec = float(updated_ms) / 1000.0
+            if updated_sec < window_start_ts:
+                print(
+                    f"Stopped scanning: conversation {ch.get('id', '?')} "
+                    "has updated timestamp before window start",
+                    file=sys.stderr,
+                )
+                stop_paging = True
+                break
+            active.append(ch)
+            spinner.update(f"Scanning conversations... {len(active)} active")
+
+        if stop_paging:
+            break
+
+        next_cursor = resp.get("response_metadata", {}).get("next_cursor")
+        if not next_cursor:
+            break
+        cursor = next_cursor
+        time.sleep(REQUEST_DELAY)
+
+    return active, scanned
+
+
+def _diary_first_top_level_ts(messages: list[dict]) -> float:
+    if not messages:
+        return 0.0
+    return min(float(m["ts"]) for m in messages)
+
+
+def diary_collect_user_ids(messages: list[dict]) -> set[str]:
+    ids: set[str] = set()
+
+    def walk(m: dict) -> None:
+        uid = m.get("user")
+        if uid:
+            ids.add(uid)
+        for r in m.get("_replies", []):
+            walk(r)
+
+    for m in messages:
+        walk(m)
+    return ids
+
+
+def diary_serialize_messages(
+    messages: list[dict],
+    uid_to_display: dict[str, str],
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for msg in sorted(messages, key=lambda m: float(m["ts"])):
+        uid = msg.get("user") or ""
+        handle = uid_to_display.get(uid, uid or "unknown")
+        author = f"@{handle}" if uid else "@unknown"
+        entry: dict[str, Any] = {
+            "ts": _msg_iso_ts(msg["ts"]),
+            "author": author,
+            "text": render_text(msg),
+            "_signal_quality": msg.get("_signal_quality", "low"),
+        }
+        replies = msg.get("_replies", [])
+        if replies:
+            entry["_replies"] = diary_serialize_messages(replies, uid_to_display)
+        result.append(entry)
+    return result
+
+
+def cmd_diary_dry_run(
+    client: WebClient,
+    diary_arg: str,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> None:
+    now_utc = datetime.now(tz=timezone.utc)
+
+    if from_date or to_date:
+        if diary_arg != DIARY_ROLLING:
+            print(
+                "ERROR: cannot combine a positional diary date with "
+                "--from/--to. Use one or the other.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if to_date:
+            end_dt = parse_date(to_date).replace(
+                hour=23, minute=59, second=59, microsecond=0
+            )
+        else:
+            end_dt = now_utc
+
+        if from_date:
+            start_dt = parse_date(from_date)
+        else:
+            start_dt = parse_date(to_date)  # --to only
+
+        if from_date and to_date and start_dt > end_dt:
+            print("ERROR: --from date must be before --to date.", file=sys.stderr)
+            sys.exit(1)
+
+        diary_date_str = (
+            f"{start_dt.strftime('%d-%m-%Y')}–{end_dt.strftime('%d-%m-%Y')}"
+        )
+    elif diary_arg != DIARY_ROLLING:
+        end_dt = parse_date(diary_arg).replace(
+            hour=23, minute=59, second=59, microsecond=0
+        )
+        start_dt = parse_date(diary_arg)
+        diary_date_str = diary_arg
+    else:
+        end_dt = now_utc
+        start_dt = end_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        diary_date_str = end_dt.strftime("%d-%m-%Y")
+
+    is_today = diary_arg == DIARY_ROLLING and not from_date and not to_date
+
+    oldest = start_dt.timestamp()
+    latest = end_dt.timestamp()
+    window_start_ts = oldest
+
+    auth_resp = api_call(client.auth_test)
+    auth_user_id = str(auth_resp.get("user_id", ""))
+
+    _diary_spinner.start("Scanning conversations...")
+    try:
+        active_chs, scanned_total = fetch_diary_active_conversations(
+            client, window_start_ts, _diary_spinner
+        )
+        _diary_spinner.stop()
+    finally:
+        _diary_spinner.stop()
+
+    print(f"Diary scan: {scanned_total} conversation(s) scanned.", file=sys.stderr)
+
+    conv_work: list[dict[str, Any]] = []
+    total_messages_raw = 0
+    active_with_messages = 0
+
+    n_candidates = len(active_chs)
+    for idx, ch in enumerate(active_chs, 1):
+        cid = ch["id"]
+        info = resolve_channel_info(client, cid)
+        label = info["display_name"]
+        ch_type = info["type"]
+        raw_ch = info.get("raw") or {}
+        dm_peer_id = str(raw_ch.get("user") or "") if ch_type == TYPE_DM else None
+
+        prefix = f"Fetching messages... {label} ({idx}/{n_candidates} channels)"
+        _diary_spinner.start(prefix)
+        try:
+            msgs = fetch_history(
+                client,
+                cid,
+                oldest,
+                latest,
+                message_filter=DIARY_ALL_MESSAGES,
+                spinner=_diary_spinner,
+                progress_prefix=prefix,
+            )
+            time.sleep(REQUEST_DELAY)
+
+            if not msgs:
+                print(
+                    f"Diary: skip {label} — no raw messages in window.",
+                    file=sys.stderr,
+                )
+                continue
+
+            active_with_messages += 1
+
+            fetch_all_thread_replies(
+                client,
+                cid,
+                msgs,
+                message_filter=DIARY_ALL_MESSAGES,
+                spinner=_diary_spinner,
+            )
+
+            raw_ct = _count_raw_tree(msgs)
+            total_messages_raw += raw_ct
+
+            filtered, dropped = diary_filter_zero_quality(msgs)
+
+            print(
+                f"Diary: {label} — raw messages {raw_ct}, dropped (zero-quality) {dropped}.",
+                file=sys.stderr,
+            )
+
+            if not filtered:
+                print(
+                    f"Diary: skip {label} — no messages remain after filtering.",
+                    file=sys.stderr,
+                )
+                continue
+
+            channel_is_dm = ch_type == TYPE_DM
+            diary_apply_signal_labels(filtered, channel_is_dm=channel_is_dm)
+
+            tier, reason = diary_classify_conversation(
+                filtered,
+                channel_type=ch_type,
+                auth_user_id=auth_user_id,
+                dm_peer_id=dm_peer_id,
+            )
+            print(
+                f"Diary: {label} — conversation tier {tier} ({reason}).",
+                file=sys.stderr,
+            )
+
+            high_ct, _med_ct, _low_ct, msg_total, authors, has_threads = (
+                _flatten_signal_counts(filtered)
+            )
+
+            conv_work.append(
+                {
+                    "_tier": tier,
+                    "_sort_ts": _diary_first_top_level_ts(filtered),
+                    "channel_id": cid,
+                    "channel_name": label,
+                    "channel_type": ch_type,
+                    "signal_quality": {
+                        "tier": tier,
+                        "reason": reason,
+                        "message_count": msg_total,
+                        "human_authors": len(authors),
+                        "high_quality_messages": high_ct,
+                        "has_threads": has_threads,
+                    },
+                    "_filtered_messages": filtered,
+                }
+            )
+        finally:
+            _diary_spinner.stop()
+            time.sleep(REQUEST_DELAY)
+
+    conv_work = [c for c in conv_work if c["_tier"] != "skip"]
+
+    tier_rank = {"high": 0, "medium": 1, "low": 2}
+    conv_work.sort(
+        key=lambda c: (tier_rank.get(c["_tier"], 9), c["_sort_ts"]),
+    )
+
+    all_uids: set[str] = set()
+    for c in conv_work:
+        all_uids |= diary_collect_user_ids(c["_filtered_messages"])
+
+    uid_to_display: dict[str, str] = {}
+    uid_list = sorted(all_uids)
+    if uid_list:
+        _diary_spinner.start("Resolving usernames...")
+        try:
+            total_u = len(uid_list)
+            for i, uid in enumerate(uid_list, 1):
+                _diary_spinner.update(f"Resolving usernames... {i}/{total_u} users")
+                disp = resolve_user(client, uid)
+                uid_to_display[uid] = disp[1:] if disp.startswith("@") else disp
+            _diary_spinner.stop()
+        finally:
+            _diary_spinner.stop()
+
+    conv_payloads: list[dict[str, Any]] = []
+    total_messages_filtered = 0
+
+    for c in conv_work:
+        authors = diary_collect_user_ids(c["_filtered_messages"])
+        participant_labels = sorted(
+            f"@{uid_to_display.get(u, u)}" for u in authors
+        )
+        messages_json = diary_serialize_messages(c["_filtered_messages"], uid_to_display)
+        conv_payloads.append(
+            {
+                "channel_id": c["channel_id"],
+                "channel_name": c["channel_name"],
+                "channel_type": c["channel_type"],
+                "signal_quality": c["signal_quality"],
+                "participants": participant_labels,
+                "messages": messages_json,
+            }
+        )
+        total_messages_filtered += c["signal_quality"]["message_count"]
+
+    high_convos = sum(1 for c in conv_payloads if c["signal_quality"]["tier"] == "high")
+    med_convos = sum(1 for c in conv_payloads if c["signal_quality"]["tier"] == "medium")
+    low_convos = sum(1 for c in conv_payloads if c["signal_quality"]["tier"] == "low")
+
+    payload = {
+        "diary_date": diary_date_str,
+        "window": {
+            "start": _dt_iso_z(start_dt),
+            "end": _dt_iso_z(end_dt),
+        },
+        "conversations_scanned": scanned_total,
+        "conversations_with_activity": active_with_messages,
+        "conversations_after_filtering": len(conv_payloads),
+        "total_messages_raw": total_messages_raw,
+        "total_messages_after_filtering": total_messages_filtered,
+        "conversations": conv_payloads,
+    }
+
+    # Phase 2: align diaries/diary_{date}.md naming with single-day vs range (match snapshot stem).
+    if is_today or start_dt.date() == end_dt.date():
+        snapshot_stem = end_dt.strftime("%Y-%m-%d")
+        snapshot_path = SNAPSHOTS_DIR / f"diary_raw_{snapshot_stem}.json"
+    else:
+        snapshot_path = SNAPSHOTS_DIR / (
+            f"diary_raw_{start_dt.strftime('%Y-%m-%d')}_"
+            f"{end_dt.strftime('%Y-%m-%d')}.json"
+        )
+
+    json_text = json.dumps(payload, indent=2) + "\n"
+    SNAPSHOTS_DIR.mkdir(exist_ok=True)
+    snapshot_path.write_text(json_text, encoding="utf-8")
+    sys.stdout.write(json_text)
+
+    print("", file=sys.stderr)
+    print(f"Written: {snapshot_path}", file=sys.stderr)
+    print("Diary dry run complete.", file=sys.stderr)
+    print(f"  Date:                {diary_date_str}", file=sys.stderr)
+    print(f"  Conversations scanned: {scanned_total}", file=sys.stderr)
+    print(f"  Active (with messages): {active_with_messages}", file=sys.stderr)
+    print(f"  After filtering:       {len(conv_payloads)}", file=sys.stderr)
+    print(f"  Total messages (raw):  {total_messages_raw}", file=sys.stderr)
+    print(f"  After filtering:       {total_messages_filtered}", file=sys.stderr)
+    print(f"  High quality convos:   {high_convos}", file=sys.stderr)
+    print(f"  Medium quality convos: {med_convos}", file=sys.stderr)
+    print(f"  Low quality convos:    {low_convos}", file=sys.stderr)
 
 
 def _format_participants(participants: list[str]) -> str:
@@ -1188,6 +1824,11 @@ def build_parser() -> argparse.ArgumentParser:
             "  python slack_export.py --channel C0123ABCDEF --from 01-01-2025 --to 30-06-2025\n"
             "  python slack_export.py --channel G0999XYZABC            # MPDM, last 30 days\n"
             "  python slack_export.py --channel D0123ABCDEF\n"
+            "  python slack_export.py --diary --dry-run\n"
+            "  python slack_export.py --diary 24-04-2026 --dry-run   # snapshots/diary_raw_YYYY-MM-DD.json\n"
+            "  python slack_export.py --diary --from 01-04-2026 --to 24-04-2026 --dry-run\n"
+            "  python slack_export.py --diary --from 01-04-2026 --dry-run\n"
+            "  python slack_export.py --diary --from 24-04-2026 --to 24-04-2026 --dry-run  # same as --diary 24-04-2026\n"
         ),
     )
     parser.add_argument(
@@ -1247,12 +1888,34 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="DD-MM-YYYY",
         help="End date (inclusive). Defaults to today.",
     )
+    parser.add_argument(
+        "--diary",
+        nargs="?",
+        const=DIARY_ROLLING,
+        default=None,
+        metavar="DD-MM-YYYY",
+        help=(
+            "Dry-run diary JSON to stdout and snapshots/diary_raw_*.json (requires --dry-run). "
+            "Optional calendar day DD-MM-YYYY (UTC full day); omit value for today 00:00 UTC through now. "
+            "Use --from / --to for ranges (not with a positional diary date)."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "With --diary: write classified payload JSON to stdout and snapshots/ "
+            "(phase 1; no LLM)."
+        ),
+    )
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    diary_mode = args.diary is not None
 
     list_flags = [args.list_all, args.list_channels, args.list_dms, bool(args.list_user)]
     if sum(1 for f in list_flags if f) > 1:
@@ -1262,7 +1925,42 @@ def main() -> None:
         )
         sys.exit(2)
 
-    if not any(list_flags) and not args.channel:
+    if diary_mode:
+        if args.channel:
+            print(
+                "ERROR: --diary cannot be combined with --channel.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if any(list_flags):
+            print(
+                "ERROR: --diary cannot be combined with --list, --list-channels, "
+                "--list-dms, or --list-user.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if args.type_filter:
+            print(
+                "ERROR: --type only applies to --list or --list-channels.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if not args.dry_run:
+            print(
+                "ERROR: Diary generation requires --dry-run in this phase; "
+                "LLM integration is not built yet.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if args.dry_run and not diary_mode:
+        print(
+            "ERROR: --dry-run is only supported with --diary in this phase.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if not any(list_flags) and not args.channel and not diary_mode:
         parser.print_help()
         sys.exit(0)
 
@@ -1276,6 +1974,14 @@ def main() -> None:
     client = load_client()
 
     try:
+        if diary_mode:
+            cmd_diary_dry_run(
+                client,
+                args.diary,
+                args.from_date,
+                args.to_date,
+            )
+            return
         if args.list_all:
             cmd_list(client, type_filter=args.type_filter)
             return
@@ -1316,6 +2022,7 @@ def main() -> None:
 
     except KeyboardInterrupt:
         _spinner.stop()
+        _diary_spinner.stop()
         print("\nInterrupted.", file=sys.stderr)
         sys.exit(130)
 

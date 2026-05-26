@@ -176,6 +176,49 @@ Export complete.
   Total messages: 1,204
 ```
 
+### Diary dry-run (phase 1)
+
+Build a structured JSON snapshot of recent Slack activity for a future LLM diary. This phase **does not** call any model, write `./diaries/`, or generate prose — it scans conversations, filters noise, classifies signal quality, prints JSON to **stdout** (for piping), and **always writes** a copy under `snapshots/` (`diary_raw_{YYYY-MM-DD}.json` for a single UTC day or “today” window; `diary_raw_{FROM}_{TO}.json` for a multi-day range). Progress and the summary go to **stderr**.
+
+```bash
+python slack_export.py --diary --dry-run
+```
+
+- **`--diary`** — Optional value `DD-MM-YYYY` (UTC calendar day: midnight through 23:59:59 UTC). Omit the value for **today** from **00:00 UTC through now**. **`--from` / `--to`** (`DD-MM-YYYY`) set an arbitrary window with `--diary` (inclusive); do **not** combine them with a positional diary date—use either a single `DD-MM-YYYY` after `--diary` or `--from`/`--to`, not both. **`--diary --to DD-MM-YYYY`** without **`--from`** selects that full UTC calendar day.
+- **`--dry-run`** — **Required** with `--diary` in phase 1. Running `--diary` without `--dry-run` exits with an error (LLM path not implemented yet).
+- **Mutual exclusion:** `--diary` cannot be combined with `--channel`, `--list`, `--list-channels`, `--list-dms`, or `--list-user`.
+- **`--dry-run`** without **`--diary`** is rejected in phase 1.
+
+Example for a specific UTC day (same JSON on stdout and under `snapshots/`):
+
+```bash
+python slack_export.py --diary 24-04-2026 --dry-run
+```
+
+Custom range and “from date to now”:
+
+```bash
+python slack_export.py --diary --from 01-04-2026 --to 24-04-2026 --dry-run
+python slack_export.py --diary --from 01-04-2026 --dry-run
+```
+
+These are equivalent for a single UTC day:
+
+```bash
+python slack_export.py --diary 24-04-2026 --dry-run
+python slack_export.py --diary --from 24-04-2026 --to 24-04-2026 --dry-run
+```
+
+To pipe JSON through another tool while keeping stderr visible:
+
+```bash
+python slack_export.py --diary --dry-run 2>/dev/tty | jq .
+```
+
+The JSON includes `window` bounds (`start` / `end` as ISO 8601 UTC), aggregate counts, and a `conversations` array sorted by conversation-level signal quality (high → medium → low), then by first message time. Each message has `_signal_quality` (`high` | `medium` | `low`); bot traffic and system subtypes are removed before classification.
+
+Spinner output during a diary run uses **stderr** so **stdout** stays valid JSON when piped.
+
 ### CLI reference
 
 | Flag | Value | Description |
@@ -188,8 +231,10 @@ Export complete.
 | `--channel` | `CHANNEL_ID` | Slack conversation ID to export. Accepts `D...` (DM), `C...` (public/private), `G...` (private/MPDM), including Slack Connect channels. |
 | `--from` | `DD-MM-YYYY` | Start date (inclusive). Defaults to 30 days ago. |
 | `--to` | `DD-MM-YYYY` | End date (inclusive). Defaults to today. |
+| `--diary` | Optional `DD-MM-YYYY` | Diary JSON dry-run (requires `--dry-run`). Writes `snapshots/diary_raw_*.json` and prints JSON to stdout. Omit the date for today 00:00 UTC–now. With `--diary`, `--from` / `--to` set a range (multi-day files use two dates in the name). |
+| `--dry-run` | — | With `--diary`: print classified JSON to stdout and persist under `snapshots/` (phase 1 only). |
 
-Only one of `--list`, `--list-channels`, `--list-dms`, `--list-user` may be passed at a time. `--type` may only be combined with `--list` or `--list-channels`.
+Only one of `--list`, `--list-channels`, `--list-dms`, `--list-user`, or **`--diary`** may be passed at a time (the latter cannot be combined with `--channel`). `--type` may only be combined with `--list` or `--list-channels`.
 
 ---
 
@@ -277,5 +322,16 @@ slack-exporter/
 ├── .env.example        # template
 ├── requirements.txt
 ├── README.md
-└── export/             # output files land here (gitignored)
+├── export/             # --channel exports (.txt), gitignored
+└── snapshots/          # diary dry-run JSON (and phase-2 API-fallback JSON), gitignored
 ```
+
+### Diary dry-run verification notes
+
+Phase 1 verification is intended to be run against a real workspace (see project spec checks a–e: bots/system messages dropped, early pagination stop logged, empty-after-filter conversations omitted, tier sanity on live data, `--diary` without `--dry-run` errors). Those checks were **not executed in CI** during implementation.
+
+**Documented caveat (no workaround in code):** Slack’s `updated` timestamp on **1:1 DMs** can lag behind real message activity. If a dry-run appears to miss an active DM, inspect early termination on `conversations.list` before changing filters.
+
+**`KNOWN_BOT_USER_IDS`:** Ships empty; populate after inspecting dry-run output for recurring integration user IDs that still look like humans, then re-run.
+
+If any verification step required a code or config workaround on your workspace, add a one-line note here for the next person.
