@@ -163,13 +163,17 @@ python slack_export.py --channel D0123ABCDEF --from 01-01-2025 --to 30-06-2025
 python slack_export.py --channel C0123ABCDEF
 ```
 
-The exported file is saved to `export/{channel_id}_{from}_{to}.txt`.
+The exported file is saved to `export/{channel_id}/{channel_id}_{yymmdd}.txt`
+(single-day) or `export/{channel_id}/{channel_id}_{yymmdd}_{yymmdd}.txt`
+(multi-day range). Dates use 2-digit year `YYMMDD` so directory listings sort
+chronologically. CLI input dates remain `DD-MM-YYYY` and the in-file header
+still uses `DD-MM-YYYY`.
 
 A summary is printed to the console:
 
 ```
 Export complete.
-  File:           export/C0123ABCDEF_01-01-2025_30-06-2025.txt
+  File:           export/C0123ABCDEF/C0123ABCDEF_250101_250630.txt
   Channel:        #product-updates (public)
   Participants:   @alice, @bob, @charlie, ... and 31 others
   Date range:     01-01-2025 → 30-06-2025
@@ -321,8 +325,11 @@ slack-exporter/
 ├── .env                # your token (not committed)
 ├── .env.example        # template
 ├── requirements.txt
+├── requirements-dev.txt  # pytest
 ├── README.md
-├── export/             # --channel exports (.txt), gitignored
+├── tests/                # pytest tests
+├── export/             # --channel exports, one folder per channel ID, gitignored
+│   └── <channel_id>/   # e.g. C0AG5NW58NN/C0AG5NW58NN_260512.txt
 └── snapshots/          # diary dry-run JSON (and phase-2 API-fallback JSON), gitignored
 ```
 

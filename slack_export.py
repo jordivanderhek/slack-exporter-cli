@@ -1706,6 +1706,24 @@ def build_output(
     return header + "\n" + body + "\n", total
 
 
+def _format_export_filename(
+    channel: str,
+    from_dt: datetime,
+    to_dt: datetime,
+) -> str:
+    """Return the basename for an export file.
+
+    Format: ``{channel}_{YYMMDD}.txt`` when from/to fall on the same calendar
+    day, otherwise ``{channel}_{YYMMDD}_{YYMMDD}.txt``. The 2-digit-year,
+    no-separator date keeps directory listings sortable by date.
+    """
+    from_yy = from_dt.strftime("%y%m%d")
+    to_yy = to_dt.strftime("%y%m%d")
+    if from_yy == to_yy:
+        return f"{channel}_{from_yy}.txt"
+    return f"{channel}_{from_yy}_{to_yy}.txt"
+
+
 def write_export(
     client: WebClient,
     channel: str,
@@ -1780,9 +1798,11 @@ def write_export(
         channel_display_name,
     )
 
-    EXPORT_DIR.mkdir(exist_ok=True)
-    filename = f"{channel}_{from_str}_{to_str}.txt"
-    output_path = EXPORT_DIR / filename
+    # TODO: optional future work — friendlier folder names (e.g. include channel
+    # display name or maintain a per-export index file). Out of scope for now.
+    channel_dir = EXPORT_DIR / channel
+    channel_dir.mkdir(parents=True, exist_ok=True)
+    output_path = channel_dir / _format_export_filename(channel, from_dt, to_dt)
 
     output_path.write_text(text, encoding="utf-8")
 
